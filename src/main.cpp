@@ -1,26 +1,3 @@
-/*
-   MIT License
-
-  Copyright (c) 2022 Felix Biego
-
-  Permission is hereby granted, free of charge, to any person obtaining a copy
-  of this software and associated documentation files (the "Software"), to deal
-  in the Software without restriction, including without limitation the rights
-  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-  copies of the Software, and to permit persons to whom the Software is
-  furnished to do so, subject to the following conditions:
-
-  The above copyright notice and this permission notice shall be included in all
-  copies or substantial portions of the Software.
-
-  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-  SOFTWARE.
-*/
 #define LGFX_USE_V1
 //#define LGFX_AUTODETECT // Autodetect board
 
@@ -34,7 +11,6 @@
 #include <ArduinoNvs.h>
 
 #include <WiFi.h>
-#include <WiFiMulti.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
@@ -43,8 +19,46 @@
 #include "Audio.h"
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
-LiquidCrystal_I2C lcd(0x27,16,2);
+#include <PubSubClient.h>
+#include <esp_log.h>
+#include <Preferences.h>
+#include <Ticker.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <stdarg.h>  // Thư viện cho va_list, va_start, va_end
 
+LiquidCrystal_I2C lcd(0x27,16,2);
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+const char* TAG = "";
+const char* mqtt_server = "113.177.27.162";  // Hoặc broker của bạn
+const int mqtt_port = 8889;
+const char* mqtt_topic_config = "lumi/qr/config";
+const char* mqtt_topic_status = "lumi/qr/status";
+const char* mqtt_topic_log = "lumi/qr/log"; // Thay thế bằng topic log của bạn
+
+const char* ssid = "LUMI_TEST";
+const char* password = "lumivn274!";
+
+// Khởi tạo UDP
+WiFiUDP ntpUDP;
+
+// Khởi tạo NTPClient
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60000); // Cập nhật mỗi 60 giây
+
+struct QRCode {
+    int id;
+    String name;
+    String account;
+    String bank;
+    String qrText;
+};
+Preferences preferences;
+std::vector<QRCode> qrList;
+int activeQRId = -1;
+static int nextQRId = 1;
+bool g_is_reverting = false;
+bool mqttLoggingEnabled = false;
 class LGFX : public lgfx::LGFX_Device
 {
 
@@ -152,20 +166,12 @@ static lv_color_t disp_draw_buf[screenWidth * SCR];
 static lv_color_t disp_draw_buf2[screenWidth * SCR];
 
 ESP32Time rtc(3 * 3600);
-WiFiMulti wifiMulti;
 HTTPClient http;
 #ifdef MUSIC_PLAYER
 Audio audio;
 #endif
 bool playing;
 
-// AppComponent testApp[] = {
-//     {.id = 0, .parent = 0, .type = LABEL, .text = "Hello world", .xPos = 20, .yPos = 20, .width = 25, .height = 25},
-//     {.id = 1, .parent = 0, .type = BUTTON, .text = "Click", .xPos = 20, .yPos = 70, .width = 100, .height = 10},
-//     {.id = 2, .parent = 0, .type = SLIDER, .text = "", .xPos = 20, .yPos = 150, .width = 250, .height = 5},
-//     {.id = 3, .parent = 0, .type = SWITCH, .text = "", .xPos = 20, .yPos = 250, .width = 50, .height = 20},
-//     {.id = 4, .parent = 0, .type = LABEL, .text = "Test app", .xPos = 20, .yPos = 300, .width = 25, .height = 25},
-// };
 
 uint8_t ext[] PROGMEM = {
     // APP DATA
@@ -182,6 +188,32 @@ uint8_t ext[] PROGMEM = {
 
 AppComponent testApp[10];
 
+void logMessage(const char* format, ...) {
+    char buffer[1024];  // Bộ đệm để chứa thông điệp log
+
+    // Lấy các tham số biến
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+
+    // Cập nhật thời gian từ NTP server
+    timeClient.update();
+    unsigned long epochTime = timeClient.getEpochTime();
+
+    // Tạo chuỗi log với thời gian
+    String logEntry = "[" + String(epochTime) + "] " + buffer;
+
+    // Log ra màn hình
+    Serial.println(logEntry);
+
+    // Gửi log qua MQTT
+    if (mqttClient.connected()) {
+        mqttClient.publish(mqtt_topic_log, logEntry.c_str());
+    } else {
+        Serial.println("MQTT not connected, unable to send log");
+    }
+}
 
 void extractApp(uint8_t *data, int size)
 {
@@ -295,11 +327,11 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
 void requestResult(int requestCode, int statusCode, String payload, long time)
 {
 
-  Serial.printf("Request %d received, time %dms, code: %d\n", requestCode, time, statusCode);
+  ESP_LOGI(TAG, "Request %d received, time %dms, code: %d\n", requestCode, time, statusCode);
 
   if (statusCode == HTTP_CODE_OK)
   {
-    Serial.println(payload);
+    ESP_LOGI(TAG, "%s", payload.c_str());
   }
 
   switch (requestCode)
@@ -449,22 +481,6 @@ void sendRequest(void *parameter)
   vTaskDelete(NULL);
 }
 
-void connectWiFi(void *parameter)
-{
-  uint8_t status;
-  while (true)
-  {
-    status = wifiMulti.run();
-    Serial.printf("WiFi trying: %d\n", status);
-    if (status == WL_CONNECTED || status == WL_CONNECT_FAILED || status == WL_DISCONNECTED || status == WL_NO_SSID_AVAIL)
-    {
-      break;
-    }
-  }
-  Serial.printf("WiFi exit: %d\n", status);
-  // When you're done, call vTaskDelete. Don't forget this!
-  vTaskDelete(NULL);
-}
 
 bool runRequest()
 {
@@ -496,53 +512,32 @@ bool runRequest()
 #ifdef MUSIC_PLAYER
 void musicPlayer(void *parameter)
 {
+	logMessage(TAG, "Music Player started");
+	while (1)
+	{
+		audio.loop();
+    	vTaskDelay(10 / portTICK_PERIOD_MS);
 
-  while (playing)
-  {
-    audio.loop();
-
-    uint32_t act = audio.getAudioCurrentTime();
-    uint32_t afd = audio.getAudioFileDuration();
-
-    int progress = 0;
-    if (afd != 0)
-    {
-      progress = int((act * 100.0) / afd);
-      lv_bar_set_value(ui_musicProgress, progress, LV_ANIM_ON);
-
-      lv_label_set_text_fmt(ui_musicPlayTime, "%02d:%02d", act / 60, act % 60);
-      lv_label_set_text_fmt(ui_musicTotalTime, "%02d:%02d", afd / 60, afd % 60);
-    }
-    // uint32_t pos =audio.getFilePos();
-  }
-  vTaskDelete(NULL);
+	}
+	vTaskDelete(NULL);
 }
 
 void runMusic()
 {
-
-  // musicPlay_Animation(ui_musicAlbumArt, 0);
-  if (!playing)
-  {
-    playing = true;
-    xTaskCreatePinnedToCore(
-        // xTaskCreate(
-        musicPlayer,    // Function that should be called
-        "Music Player", // Name of the task (for debugging)
-        16384,          // Stack size (bytes)
-        NULL,           // Parameter to pass
-        1,              // Task priority
-        // NULL
-        NULL, // Task handle
-        1);
-  }
+	xTaskCreatePinnedToCore(
+		musicPlayer,    // Function that should be called
+		"Music Player", // Name of the task (for debugging)
+		16384,          // Stack size (bytes)
+		NULL,           // Parameter to pass
+		1,              // Task priority
+		NULL, // Task handle
+		1);
 }
 
 void playFile(const char *track)
 {
-  audio.connecttoFS(SD, track);
-
-  runMusic();
+	audio.connecttoFS(SD, track);
+	logMessage(TAG, "Playing file: %s", track);
 }
 
 void playPause()
@@ -705,38 +700,7 @@ void getNVSData()
   Serial.printf("Passcode loaded %s - %d%d%d%d\n", passcode.set ? "ON" : "OFF", passcode.code[0], passcode.code[1], passcode.code[2], passcode.code[3]);
 }
 
-void setWifi()
-{
-  wifiMulti.addAP(ssid1, pass1);
-  wifiMulti.addAP(ssid2, pass2);
-  wifiMulti.addAP(ssid3, pass3);
-  wifiMulti.addAP(ssid4, pass4);
-  wifiMulti.addAP(ssid5, pass5);
 
-  String wifiList = "Saved Wifi";
-  wifiList += "\n1. " + String(ssid1);
-  wifiList += "\n2. " + String(ssid2);
-  wifiList += "\n3. " + String(ssid3);
-  wifiList += "\n4. " + String(ssid4);
-  wifiList += "\n5. " + String(ssid5);
-
-  lv_label_set_text(ui_appWifiList, wifiList.c_str());
-}
-
-void saveWifiList()
-{
-  setWifi();
-  NVS.setString("ssid1", String(ssid1));
-  NVS.setString("ssid2", String(ssid2));
-  NVS.setString("ssid3", String(ssid3));
-  NVS.setString("ssid4", String(ssid4));
-  NVS.setString("ssid5", String(ssid5));
-  NVS.setString("pass1", String(pass1));
-  NVS.setString("pass2", String(pass2));
-  NVS.setString("pass3", String(pass3));
-  NVS.setString("pass4", String(pass4));
-  NVS.setString("pass5", String(pass5));
-}
 
 void saveSettings()
 {
@@ -749,74 +713,6 @@ void saveSettings()
   printf("saved screentime %d\n", screenTime);
 }
 
-lv_obj_t *create_component(lv_obj_t *parent, AppComponent component)
-{
-  lv_obj_t *object;
-  printf("Comp %d, x:%d, y:%d > %s\n", component.type, component.xPos, component.yPos, &component.text);
-  if (component.type == LABEL)
-  {
-    object = create_label(parent, component.text, component.yPos);
-  }
-  else if (component.type == BUTTON)
-  {
-    object = create_button(parent, uuid(component.parent, component.id), component.text, component.xPos, component.yPos, component.width, component.height);
-  }
-  else if (component.type == SLIDER)
-  {
-    object = create_slider(parent, uuid(component.parent, component.id), component.xPos, component.yPos, component.width, component.height);
-  }
-  else if (component.type == SWITCH)
-  {
-    object = create_switch(parent, uuid(component.parent, component.id), component.xPos, component.yPos);
-  }
-  else
-  {
-    object = NULL;
-  }
-
-  return object;
-}
-
-void loadLocalApp(const char *path, int &size)
-{
-  Serial.printf("Reading file: %s\r\n", path);
-  int z = 0;
-  File file = SPIFFS.open(path);
-  if (!file || file.isDirectory())
-  {
-    Serial.println("- failed to open file for reading");
-    return;
-  }
-  Serial.println("- read from file:");
-  while (file.available())
-  {
-    Serial.write(file.read());
-    z++;
-  }
-  file.close();
-}
-
-void loadTestApp()
-{
-  size_t n = 10;
-  appSize = n;
-  extractApp(ext, sizeof(ext) / sizeof(ext[0]));
-
-  closeApp();
-
-  lv_obj_t *container = app_canvas();
-
-  for (int i = 0; i < n; i++)
-  {
-    if (testApp[i].parent != 0)
-    {
-      // activeApp[i] = create_component(container, testApp[i]);
-      create_component(container, testApp[i]);
-    }
-  }
-
-  launchApp("Test App", &ui_img_gear_png, true);
-}
 
 void deep_sleep()
 {
@@ -891,42 +787,6 @@ lv_obj_t *ui_backButton;
 lv_obj_t *ui_searchButton;
 lv_obj_t *ui_BankName;
 
-// static void event_navigate(lv_event_t *e)
-// {
-// 	Serial.print("event_navigate");
-// }
-// void navigation(lv_obj_t *parent)
-// {
-//     ui_Panel2 = lv_obj_create(parent);
-
-//     lv_obj_set_width(ui_Panel2, 320);
-//     lv_obj_set_height(ui_Panel2, 80);
-
-//     lv_obj_set_x(ui_Panel2, 0);
-//     lv_obj_set_y(ui_Panel2, 0);
-
-//     lv_obj_set_align(ui_Panel2, LV_ALIGN_TOP_MID);
-
-//     lv_obj_clear_flag(ui_Panel2, LV_OBJ_FLAG_SCROLLABLE);
-
-//     lv_obj_set_style_radius(ui_Panel2, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-//     lv_obj_set_style_bg_color(ui_Panel2, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
-//     lv_obj_set_style_bg_opa(ui_Panel2, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-//     lv_obj_set_style_border_width(ui_Panel2, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
-//     lv_obj_set_style_border_side(ui_Panel2, LV_BORDER_SIDE_TOP, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-//     // ui_startButton
-//     ui_startButton = lv_imgbtn_create(ui_Panel2);
-//     lv_imgbtn_set_src(ui_startButton, LV_IMGBTN_STATE_RELEASED, NULL, &Techcombank_logo, NULL);
-// 	lv_obj_set_height(ui_startButton, Techcombank_logo.header.h);
-//     lv_obj_set_width(ui_startButton, Techcombank_logo.header.w);
-
-//     lv_obj_set_x(ui_startButton, 0);
-//     lv_obj_set_y(ui_startButton, 0);
-//     lv_obj_set_align(ui_startButton, LV_ALIGN_TOP_MID);
-//     lv_obj_add_event_cb(ui_startButton, event_navigate, LV_EVENT_ALL, NULL);
-// }
-
 void ui_start_screen_init(void) {
 	ui_startScreen = lv_obj_create(NULL);
 
@@ -949,17 +809,14 @@ void ui_start_screen_init(void) {
 
 	ui_BankName = lv_imgbtn_create(ui_startScreen);
 
-	// navigation(ui_startScreen);
 }
 
 void lv_print_qrcode(const char* qr_text, const char* bank_name, const char* name, const char* account)
 {
-	printf("lv_print_qrcode\n");
 	/*Set data*/
 	lv_qrcode_update(qr, qr_text, strlen(qr_text));
 	lv_obj_center(qr);
 	lv_obj_set_align(qr, LV_ALIGN_CENTER);
-
 
     if (strcmp(bank_name, "Techcombank") == 0) {
         lv_imgbtn_set_src(ui_BankName, LV_IMGBTN_STATE_RELEASED, NULL, &techcombank, NULL);
@@ -1005,12 +862,8 @@ void lv_print_qrcode(const char* qr_text, const char* bank_name, const char* nam
 	lv_obj_set_style_text_font(account_label, &lv_font_montserrat_20, 0);
 	lv_obj_set_style_text_color(account_label, lv_color_black(), 0);  
 	lv_obj_align_to(account_label, name_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 1);
-
-	printf("lv_print_qrcode end\n");
 }
 #endif
-
-uint64_t lastTime = 0;
 
 void lcd_1602_init() {
 	Wire.begin(11, 10, 400000); 
@@ -1022,86 +875,427 @@ void lcd_1602_init() {
 	lcd.setCursor(3, 0);  
 	lcd.print("Xin Chao !!");
 }
+
+void lcd_1602_print_amount(double amount) {
+	lcd.clear();
+	lcd.setCursor(3, 0);
+	lcd.print("Amount (VND): ");
+	lcd.setCursor(0, 1);
+	lcd.print(amount);
+}
+
+void saveQRListToFlash() {
+    preferences.begin("qr-storage", false);
+    preferences.putInt("qr_count", qrList.size());
+    
+    // Lưu từng QR
+    for (size_t i = 0; i < qrList.size(); i++) {
+        String prefix = "qr_" + String(i) + "_";
+        preferences.putInt((prefix + "id").c_str(), qrList[i].id);
+        preferences.putString((prefix + "name").c_str(), qrList[i].name);
+        preferences.putString((prefix + "account").c_str(), qrList[i].account);
+        preferences.putString((prefix + "bank").c_str(), qrList[i].bank);
+        preferences.putString((prefix + "text").c_str(), qrList[i].qrText);
+    }
+    
+    // Lưu active QR ID
+    preferences.putInt("active_qr", activeQRId);
+    preferences.end();
+}
+
+void loadQRListFromFlash() {
+    preferences.begin("qr-storage", true);
+    
+    // Đọc số lượng QR
+    int qrCount = preferences.getInt("qr_count", 0);
+    
+    // Đọc từng QR
+    qrList.clear();
+    for (int i = 0; i < qrCount; i++) {
+        String prefix = "qr_" + String(i) + "_";
+        QRCode qr;
+        qr.id = preferences.getInt((prefix + "id").c_str(), 0);
+        qr.name = preferences.getString((prefix + "name").c_str(), "");
+        qr.account = preferences.getString((prefix + "account").c_str(), "");
+        qr.bank = preferences.getString((prefix + "bank").c_str(), "");
+        qr.qrText = preferences.getString((prefix + "text").c_str(), "");
+        qrList.push_back(qr);
+    }
+    
+    // Đọc active QR ID
+    activeQRId = preferences.getInt("active_qr", -1);
+    
+    // Cập nhật nextQRId
+    nextQRId = 1;
+    for(const auto& qr : qrList) {
+        if(qr.id >= nextQRId) {
+            nextQRId = qr.id + 1;
+        }
+    }
+    
+    Serial.print("Next QR ID will be: ");
+    Serial.println(nextQRId);
+
+    preferences.end();
+}
+
+void publishQRList() {
+    DynamicJsonDocument doc(8192);
+    doc["activeQRId"] = activeQRId;
+    
+    JsonArray array = doc.createNestedArray("qrList");
+    for(const auto& qr : qrList) {
+        JsonObject obj = array.createNestedObject();
+        obj["id"] = qr.id;
+        obj["name"] = qr.name;
+        obj["account"] = qr.account;
+        obj["bank"] = qr.bank;
+        obj["qrText"] = qr.qrText;
+    }
+    
+    String response;
+    serializeJson(doc, response);
+    Serial.println("publishQRList: " + response);
+    mqttClient.publish(mqtt_topic_status, response.c_str());
+}
+
+Ticker revertTicker;
+
+void revertToOriginalQR() {	
+	g_is_reverting = true;
+}
+
+void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+    if (String(topic) == mqtt_topic_config) {
+        DynamicJsonDocument doc(4096);
+        deserializeJson(doc, payload, length);
+        
+        String command = doc["command"].as<String>();
+        String type = doc["type"].as<String>();
+        
+        if (command == "activate") {
+            if (type == "static") {
+                int id = doc["id"];
+                auto it = std::find_if(qrList.begin(), qrList.end(),
+                                      [id](const QRCode& qr) { return qr.id == id; });
+                
+                if (it != qrList.end()) {
+                    activeQRId = id;
+                    saveQRListToFlash();
+                    
+                    // Phản hồi thành công
+                    DynamicJsonDocument responseDoc(256);
+                    responseDoc["status"] = "success";
+                    responseDoc["message"] = "Static QR code activated";
+                    String response;
+                    serializeJson(responseDoc, response);
+                    mqttClient.publish(mqtt_topic_status, response.c_str());
+
+                    lv_print_qrcode(it->qrText.c_str(), it->bank.c_str(), 
+                                    it->name.c_str(), it->account.c_str());
+                } else {
+                    // Phản hồi lỗi
+                    DynamicJsonDocument responseDoc(256);
+                    responseDoc["status"] = "error";
+                    responseDoc["message"] = "QR code ID not found";
+                    String response;
+                    serializeJson(responseDoc, response);
+                    mqttClient.publish(mqtt_topic_status, response.c_str());
+                }
+            } else if (type == "dynamic") {
+                String name = doc["name"].as<String>();
+                String account = doc["account"].as<String>();
+                String bank = doc["bank"].as<String>();
+                String qrText = doc["qrText"].as<String>();
+                double amount = doc["amount"].as<double>();
+                int time = doc["time"].as<int>();
+				if(time == 0) {
+					time = 10;
+				}
+                // Xử lý mã QR động
+                lv_print_qrcode(qrText.c_str(), bank.c_str(), name.c_str(), account.c_str());
+				lcd_1602_print_amount(amount);	
+                ESP_LOGI(TAG, "Dynamic QR code activated for %d seconds", time);
+
+                // Thiết lập bộ đếm thời gian để quay về mã QR gốc
+                revertTicker.once(time, revertToOriginalQR);
+
+                // Phản hồi thành công
+                DynamicJsonDocument responseDoc(256);
+                responseDoc["status"] = "success";
+                responseDoc["message"] = "Dynamic QR code activated";
+                String response;
+                serializeJson(responseDoc, response);
+                mqttClient.publish(mqtt_topic_status, response.c_str());
+            }
+        }
+        else if (command == "add") {
+			printf("add command\n");
+            QRCode qr;
+            qr.id = nextQRId++;
+            qr.name = doc["name"].as<String>();
+            qr.account = doc["account"].as<String>();
+            qr.bank = doc["bank"].as<String>();
+            qr.qrText = doc["qrText"].as<String>();
+            
+            qrList.push_back(qr);
+            saveQRListToFlash();
+            
+            // Publish updated list
+            publishQRList();
+            
+            // Phản hồi thành công
+            DynamicJsonDocument responseDoc(256);
+            responseDoc["status"] = "success";
+            responseDoc["message"] = "QR code added";
+            String response;
+            serializeJson(responseDoc, response);
+            mqttClient.publish(mqtt_topic_status, response.c_str());
+        }
+        else if (command == "delete") {
+            int idToDelete = doc["id"];
+            auto it = std::find_if(qrList.begin(), qrList.end(),
+                                  [idToDelete](const QRCode& qr) { return qr.id == idToDelete; });
+            
+            if (it != qrList.end()) {
+                if (idToDelete == activeQRId) {
+                    activeQRId = -1;
+                    lv_obj_clean(lv_scr_act());
+                }
+                qrList.erase(it);
+                saveQRListToFlash();
+                publishQRList();
+                
+                // Phản hồi thành công
+                DynamicJsonDocument responseDoc(256);
+                responseDoc["status"] = "success";
+                responseDoc["message"] = "QR code deleted";
+                String response;
+                serializeJson(responseDoc, response);
+                mqttClient.publish(mqtt_topic_status, response.c_str());
+            } else {
+                // Phản hồi lỗi
+                DynamicJsonDocument responseDoc(256);
+                responseDoc["status"] = "error";
+                responseDoc["message"] = "QR code ID not found";
+                String response;
+                serializeJson(responseDoc, response);
+                mqttClient.publish(mqtt_topic_status, response.c_str());
+            }
+        }
+        else if (command == "get_list") {
+            ESP_LOGI(TAG, "Received get_list command");
+            // Publish the current QR list
+            publishQRList();
+        }
+        else if (command == "amount_received") {
+            double receivedAmount = doc["amount"];
+            
+            // Xử lý số tiền đã nhận
+            ESP_LOGI(TAG, "Amount received: %.2f", receivedAmount);
+			if(receivedAmount == 50000) {
+				playFile("/50000.mp3");
+			} else if(receivedAmount == 200000) {
+				playFile("/200000.mp3");
+			} else if(receivedAmount == 10000) {
+				playFile("/10000.mp3");
+			} else if(receivedAmount == 1000000) {
+				playFile("/1000000.mp3");
+			} 
+            // Phản hồi thành công
+            DynamicJsonDocument responseDoc(256);
+            responseDoc["status"] = "success";
+            responseDoc["message"] = "Amount received processed";
+            String response;
+            serializeJson(responseDoc, response);
+            mqttClient.publish(mqtt_topic_status, response.c_str());
+        }
+		else if (command == "setlog") {
+            bool enable = doc["enable"].as<bool>();
+            mqttLoggingEnabled = enable;
+            Serial.printf("MQTT logging %s\n", enable ? "enabled" : "disabled");
+
+			// Tạo phản hồi JSON
+            DynamicJsonDocument responseDoc(256);
+            responseDoc["status"] = "success";
+            responseDoc["message"] = "Logging status updated";
+            responseDoc["loggingEnabled"] = enable;
+
+            // Chuyển đổi JSON thành chuỗi
+            String response;
+            serializeJson(responseDoc, response);
+
+            // Gửi phản hồi qua MQTT
+            mqttClient.publish(mqtt_topic_status, response.c_str());
+        }
+    }
+}
+
+void mqtt_start(void) {
+    mqttClient.setServer(mqtt_server, mqtt_port);
+    mqttClient.setCallback(mqtt_callback);
+}
+
+void reconnect_mqtt() {
+    while (!mqttClient.connected()) {
+        printf(TAG, "Attempting MQTT connection to ");
+        printf(TAG, mqtt_server);
+        printf(TAG, "...");
+        
+        String clientId = "ESP32Client-" + String(random(0xffff), HEX);
+        
+        if (mqttClient.connect(clientId.c_str())) {
+            ESP_LOGI(TAG, "mqtt connected");
+            mqttClient.subscribe(mqtt_topic_config);  // Subscribe to the config topic
+        } else {
+            printf("mqtt failed, rc= %d\n", mqttClient.state());
+            printf(" try again in 5 seconds\n");
+            delay(5000);
+        }
+    }
+}
+void start_ap() {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(ssid, password);
+}
+
+void start_sta() {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    printf("Connecting to WiFi\n");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        printf(".");
+    }
+    ESP_LOGI(TAG, "Connected to WiFi, IP: %s", WiFi.localIP().toString().c_str());
+}
 //HieuNM End
+Ticker logTicker;
+
+void sendSystemInfo() {
+    DynamicJsonDocument doc(1024);
+
+    doc["chipModel"] = ESP.getChipModel();
+    doc["chipCores"] = ESP.getChipCores();
+    doc["chipFrequency"] = ESP.getCpuFreqMHz();
+    doc["chipVersion"] = ESP.getChipRevision();
+    doc["ramSizeKB"] = ESP.getHeapSize() / 1024.0;
+    doc["psramSizeMB"] = ESP.getPsramSize() / (1024.0 * 1024.0);
+    doc["flashSizeMB"] = ESP.getFlashChipSize() / (1024.0 * 1024.0);
+    doc["flashSpeedMHz"] = ESP.getFlashChipSpeed() / 1000000.0;
+    doc["sdkVersion"] = ESP.getSdkVersion();
+    doc["firmwareSizeMB"] = ESP.getSketchSize() / (1024.0 * 1024.0);
+    doc["storageSpaceMB"] = SPIFFS.totalBytes() / (1024.0 * 1024.0);
+    doc["macAddress"] = WiFi.macAddress();
+
+    // Chuyển đổi JSON thành chuỗi
+    String jsonString;
+    serializeJson(doc, jsonString);
+
+    // Log ra màn hình
+    Serial.println(jsonString);
+
+    // Gửi log qua MQTT
+    if (mqttClient.connected()) {
+        // mqttClient.publish(mqtt_topic_log, jsonString.c_str());
+		logMessage(jsonString.c_str());
+    } else {
+        Serial.println("MQTT not connected, unable to send log");
+    }
+}
 
 void setup()
 {
-  Serial.begin(115200);
+	// Serial.begin(115200);
+	esp_log_level_set("*", ESP_LOG_VERBOSE);
+	ESP_LOGI(TAG, "Starting...");
 
+	loadQRListFromFlash();
+	start_sta();
+	mqtt_start();
 #ifdef MUSIC_PLAYER
-  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+	audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
 #endif
-
-  tft.init();
-  tft.initDMA();
-  tft.startWrite();
+	tft.init();
+	tft.initDMA();
+	tft.startWrite();
 
 #ifdef PLUS
 
-  pinMode(SD_CS, OUTPUT);
-  digitalWrite(SD_CS, HIGH);
-  SPI.begin(SDMMC_CLK, SDMMC_D0, SDMMC_CMD);
-  SD.begin(SD_CS);
+	pinMode(SD_CS, OUTPUT);
+	digitalWrite(SD_CS, HIGH);
+	SPI.begin(SDMMC_CLK, SDMMC_D0, SDMMC_CMD);
+	SD.begin(SD_CS);
 
 #endif
 
-  NVS.begin();
+	NVS.begin();
 
-  getNVSData();
+	getNVSData();
 
-  if (!SPIFFS.begin(FORMAT_SPIFFS_IF_FAILED))
-  {
-    Serial.println("SPIFFS Mount Failed");
-    tft.setBrightness(brightness);
+	if (!SPIFFS.begin(FORMAT_SPIFFS_IF_FAILED))
+	{
+		ESP_LOGI(TAG, "SPIFFS Mount Failed");
+		tft.setBrightness(brightness);
 
-    delay(2000);
-    ESP.restart();
-  }
+		delay(2000);
+		ESP.restart();
+	}
 
-  wakeup_reason();
+	wakeup_reason();
 
-  lv_init();
+	lv_init();
 
-  if (!disp_draw_buf)
-  {
-    Serial.println("LVGL disp_draw_buf allocate failed!");
-  }
-  else
-  {
+  	if (!disp_draw_buf)
+	{
+		ESP_LOGI(TAG, "LVGL disp_draw_buf allocate failed!");
+	}
+	else
+	{
 
-    Serial.print("Display buffer size: ");
+		ESP_LOGI(TAG, "Display buffer size: ");
 
-    lv_disp_draw_buf_init(&draw_buf, disp_draw_buf, disp_draw_buf2, screenWidth * SCR);
+		lv_disp_draw_buf_init(&draw_buf, disp_draw_buf, disp_draw_buf2, screenWidth * SCR);
 
-    /* Initialize the display */
-    lv_disp_drv_init(&disp_drv);
-    /* Change the following line to your display resolution */
-    disp_drv.hor_res = screenWidth;
-    disp_drv.ver_res = screenHeight;
-    disp_drv.flush_cb = my_disp_flush;
-    disp_drv.draw_buf = &draw_buf;
-    lv_disp_drv_register(&disp_drv);
+		/* Initialize the display */
+		lv_disp_drv_init(&disp_drv);
+		/* Change the following line to your display resolution */
+		disp_drv.hor_res = screenWidth;
+		disp_drv.ver_res = screenHeight;
+		disp_drv.flush_cb = my_disp_flush;
+		disp_drv.draw_buf = &draw_buf;
+		lv_disp_drv_register(&disp_drv);
 
-    /* Initialize the input device driver */
-    static lv_indev_drv_t indev_drv;
-    lv_indev_drv_init(&indev_drv);
-    indev_drv.type = LV_INDEV_TYPE_POINTER;
-    indev_drv.read_cb = my_touchpad_read;
-    lv_indev_drv_register(&indev_drv);
-  }
+		/* Initialize the input device driver */
+		static lv_indev_drv_t indev_drv;
+		lv_indev_drv_init(&indev_drv);
+		indev_drv.type = LV_INDEV_TYPE_POINTER;
+		indev_drv.read_cb = my_touchpad_read;
+		lv_indev_drv_register(&indev_drv);
+	}
 	tft.setBrightness(brightness);
 
 #ifdef MUSIC_PLAYER
 	audio.setVolume(21); // 0...21
 	audio.forceMono(true);
+	audio.setBalance(16);
 #endif
 	ui_start_screen_init();
-	lv_print_qrcode("https://www.google.com", "Techcombank", "Nguyen Minh Hieu", "1234567890");
-	lastTime = millis();
-
 	lcd_1602_init();
-}
+    if(activeQRId != -1) {
+        for(const auto& qr : qrList) {
+            if(qr.id == activeQRId) {
+                logMessage("Active QR: %d", qr.id);
+                lv_print_qrcode(qr.qrText.c_str(),qr.bank.c_str(), qr.name.c_str(), qr.account.c_str());
+                break;
+            }
+        }
+    }
+runMusic();
 
+    // Thiết lập Ticker để log thông tin mỗi phút
+    logTicker.attach(60, sendSystemInfo);  // 60 giây
+}
 
 void loop()
 {
@@ -1110,107 +1304,23 @@ void loop()
 	delay(5);
 #endif
 
+    if (!mqttClient.connected()) {
+        reconnect_mqtt();
+    }
+    mqttClient.loop();
 
-	if (millis() - lastTime > 10000)
-	{
-		lastTime = millis();
-		lv_print_qrcode("https://www.google.com", "Vietinbank", "Vu Thi Thu Huyen", "1902050999");
+	if(g_is_reverting) {
+		lcd.clear();
+		if(activeQRId != -1) {
+        for(const auto& qr : qrList) {
+            if(qr.id == activeQRId) {
+                logMessage("Active QR: %d", qr.id);
+                lv_print_qrcode(qr.qrText.c_str(),qr.bank.c_str(), qr.name.c_str(), qr.account.c_str());
+				break;
+				}
+			}
+		}
+		lcd.clear();
+		g_is_reverting = false;
 	}
-    // rtcTime.day = rtc.getDay();
-    // rtcTime.month = rtc.getMonth() + 1;
-    // rtcTime.year = rtc.getYear();
-
-    // tft.setBrightness(brightness);
-
-    // if (WiFi.isConnected())
-    // {
-    //   lv_obj_clear_flag(ui_searchButton, LV_OBJ_FLAG_HIDDEN);
-    //   if (!onConnect)
-    //   {
-    //     Serial.println("WiFi Connected");
-    //     runRequest();
-    //     onConnect = true;
-    //   }
-    // }
-    // else
-    // {
-    //   onConnect = false;
-    //   lv_obj_add_flag(ui_searchButton, LV_OBJ_FLAG_HIDDEN);
-    // }
-    // lv_label_set_text(ui_lockScreenTime, rtc.getTime("%H:%M").c_str());
-    // lv_label_set_text(ui_lockTime, rtc.getTime("%H:%M").c_str());
-    // lv_label_set_text(ui_lockScreenDate, rtc.getTime("%A, %B %d").c_str());
-    // lv_label_set_text(ui_actionDate, rtc.getTime("%m/%d").c_str());
 }
-
-
-void callFunction(uint8_t type)
-{
-}
-
-#ifdef MUSIC_PLAYER
-
-void setVolume(int volume)
-{
-  Serial.printf("Set volume: %d\n", volume);
-  audio.setVolume(volume);
-
-  uint32_t act = audio.getAudioCurrentTime();
-  uint32_t afd = audio.getAudioFileDuration();
-
-  Serial.printf("Duration: %d / %d \n", act, afd);
-}
-
-// optional
-void audio_info(const char *info)
-{
-  Serial.print("info        ");
-  Serial.println(info);
-  // info        Reading file: "/sky_high.mp3"
-  String inf = String(info);
-  if (inf.startsWith("Reading file:"))
-  {
-    String fl = inf.substring(16, inf.length() - 1);
-    lv_label_set_text(ui_musicTrack, fl.c_str());
-    lv_label_set_text(ui_musicMiniText, fl.c_str());
-    lv_label_set_text(ui_musicArtist, "");
-    lv_label_set_text(ui_musicAlbum, "");
-  }
-}
-void audio_id3data(const char *info)
-{ // id3 metadata
-  Serial.print("id3data     ");
-  Serial.println(info);
-  String inf = String(info);
-  if (inf.startsWith("Title: "))
-  {
-    String tt = inf.substring(7, inf.length());
-    lv_label_set_text(ui_musicTrack, tt.c_str());
-    lv_label_set_text(ui_musicMiniText, tt.c_str());
-  }
-  if (inf.startsWith("Artist: "))
-  {
-    String ats = inf.substring(8, inf.length());
-    lv_label_set_text(ui_musicArtist, ats.c_str());
-  }
-  if (inf.startsWith("Album: "))
-  {
-    String alb = inf.substring(7, inf.length());
-    lv_label_set_text(ui_musicAlbum, alb.c_str());
-  }
-}
-void audio_eof_mp3(const char *info)
-{ // end of file
-  Serial.print("eof_mp3     ");
-  Serial.println(info);
-
-  int r = random(MAX_MUSIC);
-  playFile(music[r].path);
-}
-void audio_bitrate(const char *info)
-{
-  Serial.print("bitrate     ");
-  Serial.println(info);
-}
-
-#endif

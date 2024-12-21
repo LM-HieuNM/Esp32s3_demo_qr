@@ -221,7 +221,7 @@ Alert alert;
 Time rtcTime;
 
 // user settings
-int brightness = 100;
+int brightness = 10;
 uint32_t themeColor = 0xFF0081FF;
 long timeouts[4] = {30000, 60000, 180000, 300000};
 long screenTime = 30000;
